@@ -371,7 +371,7 @@ if __name__ == '__main__':
     parser.add_argument('--exp-id', '--exp-name', type=str,
         default=None, help='Resume from experiment')
     parser.add_argument('--track', action='store_true', help='Track on WandB')
-    parser.add_argument('--wandb-project', type=str, default='pufferlib')
+    parser.add_argument('--wandb-project', type=str, default='advantage_filtering')
     parser.add_argument('--wandb-group', type=str, default='debug')
     args = parser.parse_known_args()[0]
 
