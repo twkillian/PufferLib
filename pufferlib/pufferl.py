@@ -335,10 +335,17 @@ class PuffeRL:
                 config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
 
             profile('train_copy', epoch)
+            # ADVANTAGE FILTERING HERE
+            # TWK TODO: Create a function that performs different kinds of filtering
+            # This implementation: which is an extention of PER
+            # Then, EMA (like our Apple paper), proportional filtering, taking only one sided advs (non absolute value)
+            # We can then provide a sweep option over the specific hyperparameters at play. 
             adv = advantages.abs().sum(axis=1)
             prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
             prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
             idx = torch.multinomial(prio_probs, self.minibatch_segments)
+            
+            # Constrain the minibatch according to the filtered indices
             mb_prio = (self.segments*prio_probs[idx, None])**-anneal_beta
             mb_obs = self.observations[idx]
             mb_actions = self.actions[idx]
