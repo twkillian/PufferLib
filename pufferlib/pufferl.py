@@ -10,6 +10,8 @@ warnings.filterwarnings('error', category=RuntimeWarning)
 
 
 import os
+import hashlib
+import uuid
 import sys
 import glob
 import ast
@@ -85,6 +87,10 @@ class PuffeRL:
             raise pufferlib.APIUsageError(
                 f'Total agents {total_agents} <= segments {segments}'
             )
+
+        # ~*Advantage Filtering*~
+        # Initialize the filtering function, based on the advantage estimate
+        self.adv_filter_fn = AdvFilter(config)
 
         device = config['device']
         self.observations = torch.zeros(segments, horizon, *obs_space.shape,
@@ -316,11 +322,8 @@ class PuffeRL:
         config = self.config
         device = config['device']
 
-        b0 = config['prio_beta0']
-        a = config['prio_alpha']
         clip_coef = config['clip_coef']
         vf_clip = config['vf_clip_coef']
-        anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
         self.ratio[:] = 1
 
         for mb in range(self.total_minibatches):
@@ -336,17 +339,13 @@ class PuffeRL:
 
             profile('train_copy', epoch)
             # ADVANTAGE FILTERING HERE
-            # TWK TODO: Create a function that performs different kinds of filtering
-            # This implementation: which is an extention of PER
             # Then, EMA (like our Apple paper), proportional filtering, taking only one sided advs (non absolute value)
             # We can then provide a sweep option over the specific hyperparameters at play. 
-            adv = advantages.abs().sum(axis=1)
-            prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
-            prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
-            idx = torch.multinomial(prio_probs, self.minibatch_segments)
+            idx, mb_prio = self.adv_filter_fn(advantages, self.epoch, self.total_epochs, self.minibatch_segments, self.segments)
             
             # Constrain the minibatch according to the filtered indices
-            mb_prio = (self.segments*prio_probs[idx, None])**-anneal_beta
+            # ORIG FILE CONSTRAINED FROM self.segments down to self.minibatch_segments
+            # using a form of PER to filter on advantages... So speed up comes from that default...
             mb_obs = self.observations[idx]
             mb_actions = self.actions[idx]
             mb_logprobs = self.logprobs[idx]
@@ -667,6 +666,122 @@ def dist_mean(value, device):
 
     return dist_sum(value, device) / torch.distributed.get_world_size()
 
+class AdvFilter:
+    # TWK TODO: These are generated options that may or may not be complete. First, borrow from `clean_pufferl_filtered.py`
+    # We want the PER filter, EMA filter, and then a proportional filter, then perhaps one that takes only the positive or negative advantages
+    def __init__(self, config):
+        # Get the type of filter to use, default to 'per' if not specified
+        # Options are {'none', 'per', 'ema', 'proportional', 'single_sided'}
+        self.filter_type = config.get('adv_filter_type', 'per')
+        # If we'll use abs. advantage for filtering
+        self.filter_by_abs = config.get('filter_by_abs', True) 
+        # How to aggregate the advantages across traj segment, default to sum
+        self.adv_agg = config.get('adv_agg', 'sum')
+        
+        # Extract the separate filter specific hyperparameters that will be used
+        # PER
+        self.prio_alpha = config.get('prio_alpha', 0.98)
+        self.prio_beta0 = config.get('prio_beta0', 0.99)
+        # EMA
+        self.ema_eta = config.get('ema_eta', 0.01)
+        self.ema_beta = config.get('ema_beta', 0.99)
+        # Initialize the global max advantage to None, primarily used in EMA filtering
+        self.global_max_adv = None
+        # Proportional filtering
+        self.filter_proportion = config.get('filter_proportion', 1.0)
+        # Single sided filtering, 'positive (1.0)' or 'negative (-1.0)' used to flip the advs, will only keep those > 0
+        self.single_sided_sign = config.get('single_sided_sign', 1.0)  
+
+        # TODO: Create unit tests to determine that the chosen filtering approach
+        # has the appropriate hyperparameters provided, if not revert to their defaults
+
+        # Initialize the filtering function
+        self.filter_fn = self.make_filter_fn()
+
+    def make_filter_fn(self):
+        # TWK TODO: Provide type hint with advantages to ensure that the arithmetic functions below work in the right way...
+        def filter_fn(advantages, epoch, total_epochs, minibatch_segments, segments):
+            if self.filter_by_abs:
+                advantages = advantages.abs()
+            
+            # Establish default indices and mb_priors to use the entire batch of advantages
+            init_idx = torch.arange(advantages.shape[0], device=advantages.device)
+            init_mb_prio = torch.ones(advantages.shape[0], 1, device=advantages.device)
+            
+            if self.adv_agg == 'sum':
+                adv = advantages.sum(axis=1)
+            elif self.adv_agg == 'mean':
+                adv = advantages.mean(axis=1)
+            elif self.adv_agg == 'first':
+                adv = advantages[:, 0] # TWK TODO: Need to ensure that shaping works effectively here...
+            else:
+                raise ValueError(f'Unknown advantage aggregation method: {self.adv_agg}')
+
+            if self.filter_type == 'per':
+                anneal_beta = self.prio_beta0 + (1 - self.prio_beta0) * self.prio_alpha * epoch / total_epochs
+                # Compute the prioritization weights of each aggregated advantage segment
+                prio_weights = torch.nan_to_num(adv**self.prio_alpha, 0, 0, 0)
+                prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
+                idx = torch.multinomial(prio_probs, minibatch_segments)
+
+                mb_prio = (segments * prio_probs[idx, None]) ** -anneal_beta
+
+            elif self.filter_type == 'ema':
+                adv_max_batch = adv.max().item()
+                if self.global_max_adv is None:
+                    self.global_max_adv = adv_max_batch
+                else:
+                    self.global_max_adv = adv_max_batch * self.ema_beta + \
+                        (1 - self.ema_beta) * self.global_max_adv
+                
+                # This is a mask, we need to back out the indices from the initalization
+                mask = adv >= self.ema_eta * self.global_max_adv 
+                idx = init_idx[mask]
+                mb_prio = init_mb_prio[mask]
+
+            elif self.filter_type == 'proportional':
+                # Keep top k% of advantages
+                num_to_keep = int(self.filter_proportion * adv.shape[0])
+                if num_to_keep <= 0:
+                    raise ValueError(f'filter_proportion {self.filter_proportion} is too low, must be > 0')
+                elif num_to_keep >= adv.shape[0]:
+                    idx = init_idx.clone()
+                else:
+                    _, idx = torch.topk(adv, num_to_keep, largest=True, sorted=False)
+                # TWK TODO: We want this to be a bunch of 1s for now since we'll be reducing the batch...
+                mb_prio = init_mb_prio[idx]
+
+            elif self.filter_type == 'single_sided':
+                # Keep only the advantages that are positive or negative, depending on the sign
+                mask = adv * self.single_sided_sign > 0
+                idx = init_idx[mask]
+                mb_prio = init_mb_prio[mask]
+            
+            else: # Default to "none" filter, just return a identity indexing and mb_prio
+                idx = init_idx.clone()
+                mb_prio = init_mb_prio.clone()
+
+            if len(idx) < minibatch_segments:
+                # If we have less than the minibatch segments, 
+                #  return a random sample of indices to get up to the correct number
+                num_to_add = minibatch_segments - len(idx)
+                idx = torch.cat([idx, (torch.randperm(init_idx.size(0))[:num_to_add]).to(idx.device)])
+                mb_prio = init_mb_prio[idx,:]
+            
+            # Constrain the number of minibatch segments to be a multiple of the minibatch size
+            # TWK TODO: Ensure that this doesn't remove the "best segments"
+            if len(idx) % minibatch_segments != 0:
+                idx = idx[:-(len(idx) % minibatch_segments)]
+                mb_prio = mb_prio[:-(len(mb_prio) % minibatch_segments)]
+
+            return idx, mb_prio
+        
+        return filter_fn
+
+    def __call__(self, advantages, epoch, total_epochs, minibatch_segments, segments):
+        return self.filter_fn(advantages, epoch, total_epochs, minibatch_segments, segments)
+
+
 class Profile:
     def __init__(self, frequency=5):
         self.profiles = defaultdict(lambda: defaultdict(float))
@@ -840,7 +955,34 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     if args['neptune']:
         logger = NeptuneLogger(args)
     elif args['wandb']:
-        logger = WandbLogger(args)
+        
+        # Attempt to get the Slurm Job ID
+        job_id = os.getenv('SLURM_JOB_ID')
+
+        if job_id is None:
+            # Not running under Slurm (e.g., local execution)
+            # # Generate a unique ID. Here are a few options:
+
+            # Option 1: Using UUID (Universally Unique Identifier) - Recommended for uniqueness
+            job_id = uuid.uuid4().hex[:8] # Get a hex string UUID, truncated for brevity
+
+            # Option 2: Using hashlib for a short hash of some random data or timestamp
+            # current_time_bytes = str(time.time()).encode('utf-8')
+            # random_data = os.urandom(4) # Add some randomness
+            # effective_job_id = hashlib.sha256(current_time_bytes + random_data).hexdigest()[:10] # Get 10 hex characters
+
+            # Option 3: Simpler timestamp-based unique string (less robust for pure "hash" feel)
+            # effective_job_id = f"local_{int(time.time())}_{random.randint(1000, 9999)}"
+
+        prop_filter_addon = f"keep{args['train']['filter_proportion']:.3f}" if args['train']['adv_filter_type'] == "proportional" else ""
+        ema_filter_addon = f"beta{args['train']['ema_beta']:.3f}_eta{args['train']['ema_eta']:.3f}" if args['train']['adv_filter_type'] == "ema" else ""
+        per_filter_addon = f"alpha{args['train']['prio_alpha']:.3f}_beta{args['train']['prio_beta0']:.3f}" if args['train']['adv_filter_type'] == "per" else ""
+        single_sided_addon = (f"PosOnly" if args['train']['single_sided_sign'] > 0 else (f"NegOnly" if args['train']['single_sided_sign'] < 0 else "")) if args['train']['adv_filter_type'] == "single_sided" else ""
+        adv_agg_addon = f"AdvAgg_{args['train']['adv_agg']}"
+        non_abs_addon = f"-non_abs" if not args['train']['filter_by_abs'] else ""
+        exp_name_filter_type = f"filter_{args['train']['adv_filter_type']}-{prop_filter_addon}{ema_filter_addon}{per_filter_addon}{single_sided_addon}-{adv_agg_addon}{non_abs_addon}"
+        exp_name = env_name + '-' + exp_name_filter_type + f"-id{job_id}"
+        logger = WandbLogger(args, load_id=exp_name)
 
     train_config = dict(**args['train'], env=env_name)
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
