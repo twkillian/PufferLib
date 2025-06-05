@@ -981,7 +981,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         adv_agg_addon = f"AdvAgg_{args['train']['adv_agg']}"
         non_abs_addon = f"-non_abs" if not args['train']['filter_by_abs'] else ""
         exp_name_filter_type = f"filter_{args['train']['adv_filter_type']}-{prop_filter_addon}{ema_filter_addon}{per_filter_addon}{single_sided_addon}-{adv_agg_addon}{non_abs_addon}"
-        exp_name = env_name + '-' + exp_name_filter_type + f"-id{job_id}"
+        exp_name = f"{args['wandb_exp_prefix']}{env_name}-{exp_name_filter_type}-id{job_id}"
         logger = WandbLogger(args, load_id=exp_name)
 
     train_config = dict(**args['train'], env=env_name)
@@ -1071,7 +1071,9 @@ def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
     if not args['wandb'] and not args['neptune']:
         raise pufferlib.APIUsageError('Sweeps require either wandb or neptune')
-
+    # Clean up the env_name to remove the adv filtering strategy
+    args['env_name'] = "_".join(args['env_name'].split('_')[:-1])
+    env_name = "_".join(env_name.split('_')[:-1])
     method = args['sweep'].pop('method')
     try:
         sweep_cls = getattr(pufferlib.sweep, method)
@@ -1208,6 +1210,7 @@ def load_config(env_name):
     parser.add_argument('--max-runs', type=int, default=200, help='Max number of sweep runs')
     parser.add_argument('--wandb', action='store_true', help='Use wandb for logging')
     parser.add_argument('--wandb-project', type=str, default='pufferlib')
+    parser.add_argument('--wandb-exp-prefix', type=str, default='')
     parser.add_argument('--wandb-group', type=str, default='debug')
     parser.add_argument('--neptune', action='store_true', help='Use neptune for logging')
     parser.add_argument('--neptune-name', type=str, default='pufferai')
